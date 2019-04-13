@@ -1,13 +1,12 @@
-extern crate capstone;
 extern crate unicorn;
+extern crate zydis;
 
 use byteorder::{ByteOrder, LittleEndian};
-use capstone::arch::*;
-use capstone::prelude::*;
 use std::fs::File;
 use std::io::Read;
 use std::io::Write;
 use unicorn::{Cpu, CpuX86};
+use zydis::gen::*;
 
 fn align(value: usize, alignment: usize) -> usize {
     assert!(alignment.is_power_of_two());
@@ -15,74 +14,51 @@ fn align(value: usize, alignment: usize) -> usize {
     (value + (alignment - 1)) / alignment * alignment
 }
 
-fn extract_operand_types(ops: Vec<ArchOperand>) -> Vec<x86::X86OperandType> {
-    let mut ops_vec: Vec<capstone::arch::x86::X86OperandType> = Vec::new();
-    assert_eq!(ops.len(), 2);
-    for i in ops.iter() {
-        match i {
-            ArchOperand::X86Operand(x86_operand) => ops_vec.push(x86_operand.op_type.clone()),
-            _ => {}
-        };
+fn check_mov_operands(ins: ZydisDecodedInstruction, image_base: u64) -> Option<usize> {
+    if ins.operandCount != 2 {
+        return None;
     }
-    ops_vec
-}
-
-fn check_mov_operands(detail: InsnDetail, image_base: u64) -> Option<usize> {
-    let ops = detail.arch_detail().operands();
-    let ops_vec = extract_operand_types(ops);
-    match ops_vec[0] {
-        x86::X86OperandType::Reg(r) => {
-            if r.0 == x86::X86Reg::X86_REG_EDI as u16 {
-                match ops_vec[1] {
-                    x86::X86OperandType::Imm(imm) => {
-                        if (imm as u64 & !(image_base - 1)) == image_base {
-                            println!("end of compressed data likely before {:x?}", imm);
-                            return Some(imm as usize - image_base as usize);
-                        }
-                    }
-                    _ => {}
-                };
-            };
+    if ins.operandWidth != 32 {
+        return None;
+    }
+    if ins.operands[0].type_ == ZYDIS_OPERAND_TYPE_REGISTER as u8 && ins.operands[0].reg.value == ZYDIS_REGISTER_EDI as u8 {
+        if ins.operands[1].type_ == ZYDIS_OPERAND_TYPE_IMMEDIATE as u8 {
+            let imm = ins.operands[1].imm.value.bindgen_union_field;
+            if imm > image_base && imm < image_base + 16*1024*1024 {
+                println!("end of compressed data likely before 0x{:x?}", imm);
+                return Some(imm as usize - image_base as usize);
+            }
         }
-        _ => {}
     }
     None
 }
+
 fn find_uncompressed_image_size(
     emu: &CpuX86,
     image_base: u64,
     image_size_aligned: usize,
 ) -> Option<usize> {
-    let mut cs = Capstone::new()
-        .x86()
-        .mode(arch::x86::ArchMode::Mode32)
-        .detail(true)
-        .build()
-        .unwrap();
+    let decoder = zydis::Decoder::new(ZYDIS_MACHINE_MODE_LONG_COMPAT_32, ZYDIS_ADDRESS_WIDTH_32).unwrap();
+    let formatter = zydis::Formatter::new(ZYDIS_FORMATTER_STYLE_INTEL).unwrap();
     loop {
         let halted_eip = emu.reg_read(unicorn::RegisterX86::EIP).unwrap();
         let decompressed_program = emu.mem_read(halted_eip, 32).unwrap();
-        let ins = cs.disasm_count(&decompressed_program, 0, 1).unwrap();
-        assert_eq!(ins.len(), 1);
-        for i in ins.iter() {
-            println!("{:x?} {}", halted_eip, i);
-            if i.id().0 != x86::X86Insn::X86_INS_MOV as u32 {
-                continue;
-            }
-            match check_mov_operands(cs.insn_detail(&i).unwrap(), image_base) {
-                Some(size) => return Some(size),
-                _ => {}
+        let ins = decoder.decode(&decompressed_program, halted_eip).unwrap();
+        if ins.is_some() {
+            println!("{:x?} {}", halted_eip, formatter.format_instruction(&ins.unwrap(), 200, None).unwrap());
+            if ins.unwrap().mnemonic == ZYDIS_MNEMONIC_MOV as u16 {
+                let size = check_mov_operands(ins.unwrap(), image_base);
+                if size.is_some() {
+                    return size;
+                }
             }
         }
-        match emu.emu_start(halted_eip, image_base + image_size_aligned as u64, 0, 1) {
-            Err(e) => {
-                println!("Single stepping uncompressed code failed: {}", e);
-                break;
-            }
-            Ok(_) => {}
+        let step = emu.emu_start(halted_eip, image_base + image_size_aligned as u64, 0, 1);
+        if step.is_err() {
+                println!("Single stepping uncompressed code failed: {:?}", step.err());
+                return None;
         }
     }
-    None
 }
 fn main() {
     let mut arguments = std::env::args();
