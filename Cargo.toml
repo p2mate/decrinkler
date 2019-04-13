@@ -1,0 +1,10 @@
+[package]
+name = "decrinkler"
+version = "0.1.0"
+authors = ["p2 <p2@psychaos.be>"]
+edition = "2018"
+
+[dependencies]
+byteorder = "1"
+unicorn = "0.9.0"
+capstone = "0.5.0"
