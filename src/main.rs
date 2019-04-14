@@ -43,19 +43,16 @@ fn find_uncompressed_image_size(
     loop {
         let halted_eip = emu.reg_read(unicorn::RegisterX86::EIP).unwrap();
         let decompressed_program = emu.mem_read(halted_eip, 32).unwrap();
-        let ins = decoder.decode(&decompressed_program, halted_eip).unwrap();
-        if ins.is_some() {
-            println!("{:x?} {}", halted_eip, formatter.format_instruction(&ins.unwrap(), 200, None).unwrap());
-            if ins.unwrap().mnemonic == ZYDIS_MNEMONIC_MOV as u16 {
-                let size = check_mov_operands(ins.unwrap(), image_base);
-                if size.is_some() {
+        if let Some(ins) = decoder.decode(&decompressed_program, halted_eip).unwrap() {
+            println!("{:x?} {}", halted_eip, formatter.format_instruction(&ins, 200, None).unwrap());
+            if ins.mnemonic == ZYDIS_MNEMONIC_MOV as u16 {
+                if let size @ Some(..) = check_mov_operands(ins, image_base) {
                     return size;
                 }
             }
         }
-        let step = emu.emu_start(halted_eip, image_base + image_size_aligned as u64, 0, 1);
-        if step.is_err() {
-                println!("Single stepping uncompressed code failed: {:?}", step.err());
+        if let Err(e) = emu.emu_start(halted_eip, image_base + image_size_aligned as u64, 0, 1) {
+                println!("Single stepping uncompressed code failed: {:?}", e);
                 return None;
         }
     }
@@ -78,12 +75,11 @@ fn main() {
     }
 
     let pe_offset = LittleEndian::read_u32(&program[0x3c..]) as usize;
-
-    if &program[pe_offset..=pe_offset + 3] != b"PE\x00\x00" {
+    if &program[pe_offset..pe_offset + 4] != b"PE\x00\x00" {
         eprintln!(
             "{} is not a crinkled executable got {:#x?}",
             in_filename,
-            &program[pe_offset..=pe_offset + 3]
+            &program[pe_offset..pe_offset + 4]
         );
         std::process::exit(1);
     }
@@ -125,20 +121,12 @@ fn main() {
     emu.reg_write(unicorn::RegisterX86::ESP, stack_base + stack_size as u64)
         .expect("failed to setup stack pointer");
 
-    match emu.emu_start(image_base + entry_point, image_base + 0x20000, 0, 0) {
-        Err(e) => {
-            eprintln!(
-                "{}. Emulator halted at 0x{:08x}",
-                e,
-                emu.reg_read(unicorn::RegisterX86::EIP).unwrap()
-            );
-        }
-        Ok(_) => {
-            eprintln!(
-                "Emulation stopped at 0x{:08x}",
-                emu.reg_read(unicorn::RegisterX86::EIP).unwrap()
-            );
-        }
+    let emu_run = emu.emu_start(image_base + entry_point, image_base + 0x20000, 0, 0);
+    let eip = emu.reg_read(unicorn::RegisterX86::EIP).unwrap();
+    if let Err(e) = emu_run {
+        eprintln!("{}. Emulator halted at 0x{:08x}",e, eip);
+    } else {
+        eprintln!("Emulation stopped at 0x{:08x}", eip);
     }
 
     let mut out_f = File::create(out_filename).unwrap();
@@ -149,12 +137,10 @@ fn main() {
         emu.mem_map(image_base + len as u64, section_alignment - len, unicorn::Protection::READ)
             .expect("failed to change memory protection for section alignment area");
     }
-    match find_uncompressed_image_size(&emu, image_base, image_size) {
-        Some(size) => out_f
-            .write_all(&emu.mem_read(image_base, size).unwrap())
-            .unwrap(),
-        _ => out_f
-            .write_all(&emu.mem_read(image_base, image_size).unwrap())
-            .unwrap(),
+
+    let dump_size = match find_uncompressed_image_size(&emu, image_base, image_size) {
+        Some(size) => size,
+        _ => image_size,
     };
+    out_f.write_all(&emu.mem_read(image_base, dump_size).unwrap()).unwrap();
 }
