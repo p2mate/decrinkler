@@ -18,7 +18,7 @@
                     "kind": "bin"
                 }
             },
-            "args": ["/home/p2/projects/winhello/winhello_cr.exe", "/tmp/winhello_cr.dump"],
+            "args": ["/home/p2/projects/winhello/winhello_cr.exe", "/dev/null"],
             "cwd": "${workspaceFolder}"
         },
         {
